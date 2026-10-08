@@ -2,6 +2,7 @@ import { Telegraf } from 'telegraf';
 import { Markup } from 'telegraf';
 import { GoogleGenAI } from '@google/genai';
 import { DatabaseSync } from 'node:sqlite';
+import { createServer } from 'node:http';
 import 'dotenv/config';
 
 
@@ -16,6 +17,17 @@ if (!botToken || !geminiApiKey) {
 const bot = new Telegraf(botToken);
 const ai = new GoogleGenAI({ apiKey: geminiApiKey });
 const DEFAULT_GEMINI_MODEL = 'gemini-3.5-flash-lite';
+
+// Cloudflare Containers uses this endpoint to confirm that the bot process is ready.
+createServer((request, response) => {
+  if (request.method === 'GET' && request.url === '/health') {
+    response.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
+    response.end('ok');
+    return;
+  }
+  response.writeHead(404);
+  response.end();
+}).listen(8080, '0.0.0.0');
 
 // Never let a failed Telegram callback terminate long polling.
 bot.catch(async (error, ctx) => {
