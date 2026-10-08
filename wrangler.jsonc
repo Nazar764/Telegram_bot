@@ -1,19 +1,11 @@
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
-  "name": "life-sync-bot",
+  "name": "telegram-bot",
   "main": "worker/index.js",
   "compatibility_date": "2026-10-08",
-  "containers": [
-    {
-      "class_name": "BotRunner",
-      "scheduling_policy": "durable_object",
-      "images": {
-        "base": {
-          "dockerfile": "./Dockerfile"
-        }
-      }
-    }
-  ],
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": true,
+  "preview_urls": false,
   "durable_objects": {
     "bindings": [
       {
