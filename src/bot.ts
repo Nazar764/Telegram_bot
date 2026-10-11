@@ -147,6 +147,7 @@ const saveSchedulePhotoResult = database.prepare('UPDATE profiles SET weekly_sch
 const getSetupGroupName = database.prepare('SELECT group_name FROM setup_state WHERE telegram_id = ?');
 const getBotUiMessage = database.prepare('SELECT chat_id, message_id FROM bot_ui_state WHERE telegram_id = ?');
 const saveBotUiMessage = database.prepare('INSERT INTO bot_ui_state (telegram_id, chat_id, message_id) VALUES (?, ?, ?) ON CONFLICT(telegram_id) DO UPDATE SET chat_id = excluded.chat_id, message_id = excluded.message_id');
+const clearBotUiMessage = database.prepare('DELETE FROM bot_ui_state WHERE telegram_id = ?');
 const insertScheduledEvent = database.prepare('INSERT OR IGNORE INTO scheduled_events (telegram_id, event_date, event_text) VALUES (?, ?, ?)');
 const listScheduledEvents = database.prepare('SELECT event_id, event_date, event_text FROM scheduled_events WHERE telegram_id = ? AND event_date >= ? ORDER BY event_date, event_text');
 const listScheduledEventsForDate = database.prepare('SELECT event_id, event_date, event_text FROM scheduled_events WHERE telegram_id = ? AND event_date = ? ORDER BY event_text');
@@ -203,7 +204,7 @@ type Profile = {
 type ScheduledEvent = { event_id: number; event_date: string; event_text: string };
 type ProfileField = 'timezone' | 'wake_time' | 'reminder_minutes' | 'group_name' | 'bell_schedule';
 type EditableTextField = 'group_name';
-type PendingInput = { kind: 'profile'; field: ProfileField } | { kind: 'text_edit'; field: EditableTextField } | { kind: 'edit_photo_schedule' } | { kind: 'schedule_photo_review' } | { kind: 'today_event'; date: string; time: string | null } | { kind: 'today_event_date' } | { kind: 'today_event_time'; date: string } | { kind: 'today_event_end'; date: string; startTime: string } | { kind: 'today_event_title'; date: string; startTime: string; endTime: string | null } | { kind: 'today_event_manual_end'; date: string; startTime: string; title: string } | { kind: 'edit_today_event'; eventId: number } | { kind: 'schedule_photo' };
+type PendingInput = { kind: 'profile'; field: ProfileField } | { kind: 'text_edit'; field: EditableTextField } | { kind: 'edit_schedule_text' } | { kind: 'edit_schedule_day'; dayCode: WeekdayCode } | { kind: 'edit_photo_schedule' } | { kind: 'schedule_photo_review' } | { kind: 'today_event'; date: string; time: string | null } | { kind: 'today_event_date' } | { kind: 'today_event_time'; date: string } | { kind: 'today_event_end'; date: string; startTime: string } | { kind: 'today_event_title'; date: string; startTime: string; endTime: string | null } | { kind: 'today_event_manual_end'; date: string; startTime: string; title: string } | { kind: 'edit_today_event'; eventId: number } | { kind: 'schedule_photo' };
 const photoDraftSet = database.prepare('INSERT INTO schedule_photo_drafts (telegram_id, schedule, bell_schedule, file_id) VALUES (?, ?, ?, ?) ON CONFLICT(telegram_id) DO UPDATE SET schedule = excluded.schedule, bell_schedule = excluded.bell_schedule, file_id = excluded.file_id');
 const photoDraftGet = database.prepare('SELECT schedule, bell_schedule AS bellSchedule, file_id AS fileId FROM schedule_photo_drafts WHERE telegram_id = ?');
 const photoDraftDelete = database.prepare('DELETE FROM schedule_photo_drafts WHERE telegram_id = ?');
@@ -221,6 +222,8 @@ database.prepare("DELETE FROM setup_state WHERE step IN ('WAITING_FOR_PROFILE_NO
 const stateSteps: Record<PendingInput['kind'], string> = {
   profile: 'wait_profile',
   text_edit: 'text_edit',
+  edit_schedule_text: 'wait_edit_schedule_text',
+  edit_schedule_day: 'wait_edit_schedule_day',
   edit_photo_schedule: 'wait_edit_photo_schedule',
   schedule_photo_review: 'wait_schedule_photo_review',
   today_event: 'wait_today_event',
@@ -271,6 +274,12 @@ const pendingInputs = {
     const row = readSetupState.get(userId) as { step: string; field: string | null } | undefined;
     if (!row) return undefined;
     if (row.step === 'WAITING_FOR_GROUP_NAME') return { kind: 'text_edit', field: 'group_name' };
+    if (row.step === 'wait_edit_schedule_text') return { kind: 'edit_schedule_text' };
+    if (row.step === 'wait_edit_schedule_day') {
+      const value = row.field ?? '';
+      const code = value as WeekdayCode;
+      return (code === 'пн' || code === 'вт' || code === 'ср' || code === 'чт' || code === 'пт' || code === 'сб' || code === 'нд') ? { kind: 'edit_schedule_day', dayCode: code } : undefined;
+    }
     if (row.step === 'wait_edit_photo_schedule') return { kind: 'edit_photo_schedule' };
     if (row.step === 'wait_schedule_photo_review') return { kind: 'schedule_photo_review' };
     if (row.step === 'wait_today_event_date') return { kind: 'today_event_date' };
@@ -701,6 +710,12 @@ async function renderInteractiveMenu(ctx: any, text: string, markup: any) {
         throw error;
       }
       console.warn('Не вдалося оновити збережене меню; буде створено нове повідомлення:', error);
+      try {
+        await ctx.telegram.deleteMessage(storedMessage.chat_id, storedMessage.message_id);
+      } catch {
+        // Old menu can already be unavailable or inaccessible.
+      }
+      clearBotUiMessage.run(ctx.from.id);
     }
   }
 
@@ -749,6 +764,81 @@ function dayCodeFromText(line: string): string | undefined {
     if (code) return code;
   }
   return undefined;
+}
+
+function weekdayName(dayCode: WeekdayCode) {
+  const names: Record<WeekdayCode, string> = { пн: 'Понеділок', вт: 'Вівторок', ср: 'Середа', чт: 'Четвер', пт: "П'ятниця", сб: 'Субота', нд: 'Неділя' };
+  return names[dayCode];
+}
+
+function getScheduleDayBlock(scheduleText: string, dayCode: WeekdayCode) {
+  const lines = scheduleText.split(/\r?\n/u);
+  let inTarget = false;
+  const block: string[] = [];
+
+  for (const raw of lines) {
+    const line = raw.trim();
+    if (!line) {
+      if (inTarget) block.push('');
+      continue;
+    }
+
+    const currentDay = dayCodeFromText(line);
+    if (currentDay) {
+      if (currentDay === dayCode) {
+        inTarget = true;
+        const labelPattern = new RegExp(`^\\s*(?:${weekdayName(dayCode).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}|${dayCode})\\s*[:：]?\\s*`, 'iu');
+        const withoutHeader = line.replace(labelPattern, '').trim();
+        if (withoutHeader) block.push(withoutHeader);
+      } else if (inTarget) {
+        break;
+      }
+      continue;
+    }
+
+    if (inTarget) block.push(line);
+  }
+
+  return block.join('\n').trim();
+}
+
+function replaceScheduleDayText(scheduleText: string, dayCode: WeekdayCode, newText: string) {
+  const cleaned = newText.trim();
+  const header = `${weekdayName(dayCode)}: ${cleaned}`;
+  const lines = scheduleText.split(/\r?\n/u).map((line) => line.trim());
+  const output: string[] = [];
+  let replaced = false;
+  let inTarget = false;
+
+  for (const line of lines) {
+    if (!line) {
+      if (!inTarget) output.push('');
+      continue;
+    }
+
+    const currentDay = dayCodeFromText(line);
+    if (currentDay) {
+      if (currentDay === dayCode) {
+        output.push(header);
+        replaced = true;
+        inTarget = true;
+        continue;
+      }
+      if (inTarget) {
+        inTarget = false;
+      }
+    }
+
+    if (inTarget) continue;
+    output.push(line);
+  }
+
+  if (!replaced) {
+    if (output.length > 0 && output[output.length - 1] !== '') output.push('');
+    output.push(header);
+  }
+
+  return output.join('\n').trim();
 }
 
 function readCurrentTodayItems(profile: Profile, date = localDate(profile.timezone)): CancellableTodayItem[] {
@@ -1044,8 +1134,18 @@ bot.start(async (ctx) => {
     pendingInputs.delete(ctx.from.id);
     schedulePhotoDrafts.delete(ctx.from.id);
     upsertProfile.run(ctx.from.id, ctx.from.first_name, ctx.from.username ?? null);
+    const storedMessage = getBotUiMessage.get(ctx.from.id) as { chat_id: number; message_id: number } | undefined;
+    if (storedMessage) {
+      try {
+        await ctx.telegram.deleteMessage(storedMessage.chat_id, storedMessage.message_id);
+      } catch {
+        // The old menu may already be gone; we still want to replace it with the fresh startup menu.
+      }
+      clearBotUiMessage.run(ctx.from.id);
+    }
     const profile = getProfile.get(ctx.from.id) as { is_active: number } | undefined;
-    await renderInteractiveMenu(ctx, accountMessage(profile?.is_active === 1), mainMenu(profile?.is_active === 1));
+    const text = accountMessage(profile?.is_active === 1);
+    await renderInteractiveMenu(ctx, text, mainMenu(profile?.is_active === 1));
   } catch (error) {
     console.error('Не вдалося створити або оновити профіль:', error);
     await ctx.reply('❌ Не вдалося завантажити профіль. Спробуйте ще раз пізніше.');
@@ -1186,8 +1286,28 @@ bot.action('profile:group_name', async (ctx) => {
   if (callbackMessage) pendingInputs.setPrompt(ctx.from.id, callbackMessage.chat.id, callbackMessage.message_id);
 });
 
+function scheduleEditDayMenu() {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback('Пн', 'schedule:edit-day:пн'), Markup.button.callback('Вт', 'schedule:edit-day:вт'), Markup.button.callback('Ср', 'schedule:edit-day:ср')],
+    [Markup.button.callback('Чт', 'schedule:edit-day:чт'), Markup.button.callback('Пт', 'schedule:edit-day:пт'), Markup.button.callback('Сб', 'schedule:edit-day:сб')],
+    [Markup.button.callback('Нд', 'schedule:edit-day:нд')],
+    [Markup.button.callback('⬅️ Назад', 'menu:schedule')],
+  ]);
+}
+
 bot.action('schedule:edit', async (ctx) => {
-  await ctx.answerCbQuery('Функція редагування розкладу тимчасово недоступна.');
+  await ctx.answerCbQuery();
+  await ctx.editMessageText('✏️ Вибери день, який хочеш редагувати:', scheduleEditDayMenu());
+});
+
+bot.action(/^schedule:edit-day:(пн|вт|ср|чт|пт|сб|нд)$/u, async (ctx) => {
+  const dayCode = ctx.match[1] as WeekdayCode;
+  const profile = readProfile(ctx.from.id);
+  if (!profile) return ctx.answerCbQuery('Спершу надішліть /start.');
+  const currentDayText = getScheduleDayBlock(profile.weekly_schedule, dayCode).trim();
+  pendingInputs.set(ctx.from.id, { kind: 'edit_schedule_day', dayCode });
+  await ctx.answerCbQuery();
+  await ctx.reply(currentDayText || 'Поки нічого не записано для цього дня.', Markup.forceReply().placeholder('08:30-10:00 Математика'));
 });
 
 bot.action('schedule:clear', async (ctx) => {
@@ -1393,7 +1513,7 @@ bot.action('input:cancel', async (ctx) => {
     if (profile) await ctx.editMessageText(notificationSettingsText(profile), notificationSettingsMenu(profile));
   }
   else if (pending?.kind === 'profile' || pending?.kind === 'text_edit') await showProfileMenu(ctx);
-  else if (pending?.kind === 'edit_photo_schedule' || pending?.kind === 'schedule_photo' || pending?.kind === 'schedule_photo_review') await showScheduleMenu(ctx);
+  else if (pending?.kind === 'edit_schedule_text' || pending?.kind === 'edit_schedule_day' || pending?.kind === 'edit_photo_schedule' || pending?.kind === 'schedule_photo' || pending?.kind === 'schedule_photo_review') await showScheduleMenu(ctx);
   else if (pending?.kind === 'today_event' || pending?.kind === 'today_event_date' || pending?.kind === 'today_event_time' || pending?.kind === 'today_event_end' || pending?.kind === 'today_event_title' || pending?.kind === 'today_event_manual_end' || pending?.kind === 'edit_today_event') await showEventsMenu(ctx);
   else {
     const profile = readProfile(ctx.from.id);
@@ -1440,6 +1560,22 @@ bot.on('text', async (ctx) => {
     }
     if (!value) {
       await ctx.reply('Значення не може бути порожнім. Спробуйте ще раз.', cancelKeyboard());
+      return;
+    }
+
+    if (pending.kind === 'edit_schedule_day') {
+      const profile = readProfile(ctx.from.id);
+      if (!profile) {
+        pendingInputs.delete(ctx.from.id);
+        await ctx.reply('Спершу надішліть /start.');
+        return;
+      }
+      const nextSchedule = replaceScheduleDayText(profile.weekly_schedule, pending.dayCode, value);
+      database.prepare('UPDATE profiles SET weekly_schedule = ?, weekly_schedule_html = ? WHERE telegram_id = ?').run(nextSchedule, escapeHtml(nextSchedule), ctx.from.id);
+      deletePendingNotifications.run(ctx.from.id);
+      pendingInputs.delete(ctx.from.id);
+      await ctx.reply(`✅ Розклад для ${weekdayName(pending.dayCode)} оновлено.`);
+      await showScheduleMenu(ctx);
       return;
     }
 
@@ -1625,6 +1761,11 @@ bot.on('text', async (ctx) => {
 
     if (pending.kind === 'schedule_photo') {
       await ctx.reply('Зараз очікую фото. Надішліть зображення або натисніть «Скасувати».', cancelKeyboard());
+      return;
+    }
+
+    if (pending.kind !== 'profile') {
+      await ctx.reply('Невідомий стан введення. Спробуйте ще раз.', cancelKeyboard());
       return;
     }
 
