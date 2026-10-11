@@ -1,6 +1,13 @@
 import { Telegraf } from 'telegraf';
 import { Markup } from 'telegraf';
 import { GoogleGenAI } from '@google/genai';
+import {
+  bellScheduleTimes,
+  pairNumberFromScheduleLine,
+  scheduleEntriesForDay,
+  weekdayCodeFromName,
+  type WeekdayCode,
+} from './scheduleParsing.js';
 type Statement = { get(...params: unknown[]): unknown; all(...params: unknown[]): unknown[]; run(...params: unknown[]): unknown };
 type SyncDatabase = { exec(sql: string): void; prepare(sql: string): Statement };
 type BotConfig = { BOT_TOKEN?: string; GEMINI_API_KEY?: string; SEMESTER_START_DATE?: string };
@@ -83,6 +90,11 @@ database.exec(`
     bell_schedule TEXT NOT NULL DEFAULT '',
     file_id TEXT NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS bot_ui_state (
+    telegram_id INTEGER PRIMARY KEY,
+    chat_id INTEGER NOT NULL,
+    message_id INTEGER NOT NULL
+  );
 `);
 
 // Migrate existing profiles tables without changing their existing data.
@@ -133,6 +145,8 @@ const updateTodayEvents = database.prepare('UPDATE profiles SET today_events = ?
 const updateTodayExclusions = database.prepare('UPDATE profiles SET today_event_exclusions = ?, today_event_exclusions_date = ? WHERE telegram_id = ?');
 const saveSchedulePhotoResult = database.prepare('UPDATE profiles SET weekly_schedule = ?, weekly_schedule_html = ?, raw_schedule_photo_id = ?, bell_schedule = ? WHERE telegram_id = ?');
 const getSetupGroupName = database.prepare('SELECT group_name FROM setup_state WHERE telegram_id = ?');
+const getBotUiMessage = database.prepare('SELECT chat_id, message_id FROM bot_ui_state WHERE telegram_id = ?');
+const saveBotUiMessage = database.prepare('INSERT INTO bot_ui_state (telegram_id, chat_id, message_id) VALUES (?, ?, ?) ON CONFLICT(telegram_id) DO UPDATE SET chat_id = excluded.chat_id, message_id = excluded.message_id');
 const insertScheduledEvent = database.prepare('INSERT OR IGNORE INTO scheduled_events (telegram_id, event_date, event_text) VALUES (?, ?, ?)');
 const listScheduledEvents = database.prepare('SELECT event_id, event_date, event_text FROM scheduled_events WHERE telegram_id = ? AND event_date >= ? ORDER BY event_date, event_text');
 const listScheduledEventsForDate = database.prepare('SELECT event_id, event_date, event_text FROM scheduled_events WHERE telegram_id = ? AND event_date = ? ORDER BY event_text');
@@ -153,6 +167,14 @@ const deleteUnsentNotifications = database.prepare("DELETE FROM notification_que
 const getNotificationByKey = database.prepare('SELECT 1 FROM notification_queue WHERE telegram_id = ? AND event_date = ? AND event_key = ?');
 const recordMorningSchedule = database.prepare("INSERT OR IGNORE INTO notification_queue (telegram_id, event_date, event_key, notify_at, event_at, message, status) VALUES (?, ?, 'morning_schedule', ?, ?, ?, 'sent')");
 if (!workerStorage && !hadReminderSetting) database.prepare("DELETE FROM notification_queue WHERE status != 'sent'").run();
+
+bot.use(async (ctx, next) => {
+  const message = ctx.callbackQuery?.message;
+  if (message && 'message_id' in message && ctx.chat?.type === 'private' && ctx.from) {
+    saveBotUiMessage.run(ctx.from.id, message.chat.id, message.message_id);
+  }
+  await next();
+});
 
 // Preserve events saved by older versions in profiles.today_events.
 const legacyEvents = database.prepare('SELECT telegram_id, today_events, today_events_date FROM profiles WHERE today_events != \'\' AND today_events_date != \'\'').all() as Array<{ telegram_id: number; today_events: string; today_events_date: string }>;
@@ -406,65 +428,12 @@ function weekParityForDate(isoDate: string) {
 
 function weeklyScheduleForDate(schedule: string, isoDate: string, timezone: string) {
   const weekday = new Intl.DateTimeFormat('en-US', { timeZone: timezone, weekday: 'long' }).format(new Date(`${isoDate}T12:00:00Z`));
-  const dayCodes: Record<string, string> = { Monday: 'пн', Tuesday: 'вт', Wednesday: 'ср', Thursday: 'чт', Friday: 'пт', Saturday: 'сб', Sunday: 'нд' };
-  const todayCode = dayCodes[weekday];
+  const todayCode = weekdayCodeFromName(weekday);
   const parityMarker = weekParityForDate(isoDate) === 'Чисельник' ? 'ЧБ' : 'ЗН';
-  const dayIndex = ({ пн: 0, вт: 1, ср: 2, чт: 3, пт: 4, сб: 5, нд: 6 } as Record<string, number>)[todayCode ?? ''];
+  if (!todayCode) return '';
+  const dayIndex = ({ пн: 0, вт: 1, ср: 2, чт: 3, пт: 4, сб: 5, нд: 6 } as Record<WeekdayCode, number>)[todayCode];
   if (dayIndex === undefined) return '';
-
-  let inTodaySection = false;
-  const result: string[] = [];
-  for (const rawLine of schedule.split(/\r?\n/)) {
-    const line = rawLine.trim();
-    if (!line) continue;
-    const header = parseScheduleDayHeader(line);
-    if (header) {
-      // OCR stores parity both on the day heading and on individual lessons.
-      // A plain "Понеділок:" heading must remain eligible; lesson-level [ЧБ]/[ЗН]
-      // markers are filtered below. Requiring parity on every heading dropped
-      // the whole day's schedule for the common OCR format.
-      inTodaySection = header.dayCode === todayCode && (!header.parity || header.parity === parityMarker);
-      if (inTodaySection) result.push(`${scheduleDays[dayIndex]} [${parityMarker}]:`);
-      continue;
-    }
-    if (/^(понеділок|вівторок|середа|четвер|п[’ʼ']?ятниця|субота|неділя|пн|вт|ср|чт|пт|сб|нд)\b/iu.test(line)) {
-      inTodaySection = false;
-      continue;
-    }
-    if (!inTodaySection) continue;
-    const entryParity = line.match(/\[(ЧБ|ЗН)\]/iu)?.[1]?.toLocaleUpperCase('uk-UA');
-    if (entryParity && entryParity !== parityMarker) continue;
-    // Accept common OCR/manual forms: "1 пара ...", "1. Назва", "1: 08:30...",
-    // and a time-first entry such as "08:30-09:50 Назва".
-    if (/^\s*(?:[-•]\s*)?(?:\[(?:ЧБ|ЗН)\]\s*)?(?:\[\d{1,2}\]\s*)?\d{1,2}\s*(?:пара\b|[:.)-]|(?=\s+\p{L}))/iu.test(line)
-      || /^\s*(?:[-•]\s*)?\d{1,2}:\d{2}\s*[-–—]\s*\d{1,2}:\d{2}\b/u.test(line)) {
-      result.push(line);
-    }
-  }
-  return result.join('\n');
-}
-
-function parseScheduleDayHeader(line: string) {
-  const match = line.match(/^(понеділок|вівторок|середа|четвер|п[’ʼ']?ятниця|субота|неділя|пн|вт|ср|чт|пт|сб|нд)(?:\s*(?:\[(ЧБ|ЗН)\]|\((ЧБ|ЗН)\)))?\s*:?$/iu);
-  if (!match) return undefined;
-  const dayCode = dayCodeFromText(match[1] ?? '');
-  if (!dayCode) return undefined;
-  return { dayCode, parity: (match[2] ?? match[3])?.toLocaleUpperCase('uk-UA') };
-}
-
-function pairNumberFromScheduleLine(line: string) {
-  const match = line.match(/^\s*(?:[-•]\s*)?(?:\[(?:ЧБ|ЗН)\]\s*)?(?:\[(\d{1,2})\]\s*)?(\d{1,2})\s*(?:пара\b|[:.)-]|(?=\s+\p{L}))/iu);
-  const pairNumber = Number(match?.[1] ?? match?.[2]);
-  return Number.isInteger(pairNumber) && pairNumber > 0 ? pairNumber : undefined;
-}
-
-function bellScheduleTimes(bellSchedule: string) {
-  const times = new Map<number, number>();
-  for (const line of bellSchedule.split(/\r?\n/)) {
-    const match = line.match(/^\s*(\d{1,2})\s*(?:пара\b\s*)?[:.)-]\s*([01]?\d|2[0-3]):([0-5]\d)\s*[-–—]\s*([01]?\d|2[0-3]):([0-5]\d)/iu);
-    if (match) times.set(Number(match[1]), Number(match[2]) * 60 + Number(match[3]));
-  }
-  return times;
+  return scheduleEntriesForDay(schedule, todayCode, parityMarker, scheduleDays[dayIndex] ?? weekday);
 }
 
 function parseScheduledEvent(input: string, timezone: string, defaultDate = localDate(timezone)): { eventDate: string; eventText: string } {
@@ -641,19 +610,19 @@ function readProfile(userId: number): Profile | undefined {
   return getProfile.get(userId) as Profile | undefined;
 }
 
-async function showProfileMenu(ctx: any, edit = true) {
+async function showProfileMenu(ctx: any) {
   const profile = readProfile(ctx.from.id);
   if (!profile) return ctx.answerCbQuery('Спершу надішліть /start.');
   const text = profileMenuText(profile);
-  return edit ? ctx.editMessageText(text, profileMenu(profile)) : ctx.reply(text, profileMenu(profile));
+  return renderInteractiveMenu(ctx, text, profileMenu(profile));
 }
 
-async function showScheduleMenu(ctx: any, edit = true) {
+async function showScheduleMenu(ctx: any) {
   const profile = readProfile(ctx.from.id);
   if (!profile) return ctx.answerCbQuery('Спершу надішліть /start.');
   const text = scheduleMenuText(profile);
   const markup = { ...scheduleMenu(profile), parse_mode: 'HTML' as const };
-  return edit ? ctx.editMessageText(text, markup) : ctx.reply(text, markup);
+  return renderInteractiveMenu(ctx, text, markup);
 }
 
 function getOneOffEvents(userId: number, timezone: string): ScheduledEvent[] {
@@ -711,12 +680,40 @@ async function safeEditMessageText(ctx: any, text: string, markup: any) {
   }
 }
 
-async function showEventsMenu(ctx: any, edit = true) {
+async function renderInteractiveMenu(ctx: any, text: string, markup: any) {
+  const callbackMessage = ctx.callbackQuery?.message;
+  if (callbackMessage && 'message_id' in callbackMessage) {
+    await safeEditMessageText(ctx, text, markup);
+    return;
+  }
+
+  const storedMessage = getBotUiMessage.get(ctx.from.id) as { chat_id: number; message_id: number } | undefined;
+  if (storedMessage) {
+    try {
+      await ctx.telegram.editMessageText(storedMessage.chat_id, storedMessage.message_id, undefined, text, markup);
+      return;
+    } catch (error) {
+      const description = (error as { response?: { description?: string } })?.response?.description ?? '';
+      if (description.includes('message is not modified')) return;
+      if (!description.includes('message to edit not found')
+        && !description.includes("message can't be edited")
+        && !description.includes('message_id_invalid')) {
+        throw error;
+      }
+      console.warn('Не вдалося оновити збережене меню; буде створено нове повідомлення:', error);
+    }
+  }
+
+  const message = await ctx.reply(text, markup);
+  saveBotUiMessage.run(ctx.from.id, message.chat.id, message.message_id);
+}
+
+async function showEventsMenu(ctx: any) {
   const profile = readProfile(ctx.from.id);
   if (!profile) return ctx.answerCbQuery('Спершу надішліть /start.');
   const events = getOneOffEvents(ctx.from.id, profile.timezone);
   const message = `📌 Події\n\n${events.length ? events.map((event) => `${event.event_date} — ${event.event_text}`).join('\n') : 'Майбутніх подій поки немає.'}`;
-  return edit ? safeEditMessageText(ctx, message, eventsMenu()) : ctx.reply(message, eventsMenu());
+  return renderInteractiveMenu(ctx, message, eventsMenu());
 }
 
 async function showOneOffChoices(ctx: any, operation: 'delete' | 'edit') {
@@ -1048,7 +1045,7 @@ bot.start(async (ctx) => {
     schedulePhotoDrafts.delete(ctx.from.id);
     upsertProfile.run(ctx.from.id, ctx.from.first_name, ctx.from.username ?? null);
     const profile = getProfile.get(ctx.from.id) as { is_active: number } | undefined;
-    await ctx.reply(accountMessage(profile?.is_active === 1), mainMenu(profile?.is_active === 1));
+    await renderInteractiveMenu(ctx, accountMessage(profile?.is_active === 1), mainMenu(profile?.is_active === 1));
   } catch (error) {
     console.error('Не вдалося створити або оновити профіль:', error);
     await ctx.reply('❌ Не вдалося завантажити профіль. Спробуйте ще раз пізніше.');
@@ -1065,9 +1062,9 @@ bot.command('cancel', async (ctx) => {
     const profile = readProfile(ctx.from.id);
     if (profile) await ctx.reply(notificationSettingsText(profile), notificationSettingsMenu(profile));
   }
-  else if (pending?.kind === 'profile' || pending?.kind === 'text_edit') await showProfileMenu(ctx, false);
-  else if (pending?.kind === 'schedule_photo' || pending?.kind === 'edit_photo_schedule' || pending?.kind === 'schedule_photo_review') await showScheduleMenu(ctx, false);
-  else if (pending) await showEventsMenu(ctx, false);
+  else if (pending?.kind === 'profile' || pending?.kind === 'text_edit') await showProfileMenu(ctx);
+  else if (pending?.kind === 'schedule_photo' || pending?.kind === 'edit_photo_schedule' || pending?.kind === 'schedule_photo_review') await showScheduleMenu(ctx);
+  else if (pending) await showEventsMenu(ctx);
 });
 
 bot.action('account:toggle', async (ctx) => {
@@ -1458,7 +1455,7 @@ bot.on('text', async (ctx) => {
       deletePendingNotifications.run(ctx.from.id);
       pendingInputs.delete(ctx.from.id);
       await ctx.reply('✅ Виправлений розклад збережено.');
-      await showScheduleMenu(ctx, false);
+      await showScheduleMenu(ctx);
       return;
     }
 
@@ -1494,14 +1491,14 @@ bot.on('text', async (ctx) => {
           createScheduledEvent(ctx.from.id, profile.timezone, pending.date, `${pending.time} ${trimmed}`);
           pendingInputs.delete(ctx.from.id);
           await ctx.reply(`✅ Подію додано на ${pending.date}: ${pending.time} ${trimmed}`);
-          await showEventsMenu(ctx, false);
+          await showEventsMenu(ctx);
           return;
         }
         const parsed = parseScheduledEvent(value, profile.timezone, pending.date);
         createScheduledEvent(ctx.from.id, profile.timezone, parsed.eventDate, parsed.eventText);
         pendingInputs.delete(ctx.from.id);
         await ctx.reply(`Подію додано на ${parsed.eventDate}: ${parsed.eventText}`);
-        await showEventsMenu(ctx, false);
+        await showEventsMenu(ctx);
       } catch (error) {
         console.error('Не вдалося зберегти подію:', error);
         const message = error instanceof Error ? error.message : 'Спробуйте ще раз.';
@@ -1572,7 +1569,7 @@ bot.on('text', async (ctx) => {
         createScheduledEvent(ctx.from.id, profile.timezone, pending.date, eventText);
         pendingInputs.delete(ctx.from.id);
         await ctx.reply(`✅ Подію додано на ${pending.date}: ${eventText}${pending.endTime ? '' : ' (час завершення оцінив Gemini)'}`);
-        await showEventsMenu(ctx, false);
+        await showEventsMenu(ctx);
       } catch (error) {
         console.error('Не вдалося зберегти подію:', error);
         await ctx.reply('❌ Не вдалося зберегти подію. Спробуйте надіслати її ще раз.', Markup.forceReply().placeholder(value));
@@ -1601,7 +1598,7 @@ bot.on('text', async (ctx) => {
       createScheduledEvent(ctx.from.id, profile.timezone, pending.date, eventText);
       pendingInputs.delete(ctx.from.id);
       await ctx.reply(`✅ Подію додано на ${pending.date}: ${eventText}`);
-      await showEventsMenu(ctx, false);
+      await showEventsMenu(ctx);
       return;
     }
 
@@ -1617,7 +1614,7 @@ bot.on('text', async (ctx) => {
         syncTodayEventsProfile(ctx.from.id, profile.timezone);
         pendingInputs.delete(ctx.from.id);
         await ctx.reply(`Подію оновлено: ${parsed.eventDate} — ${parsed.eventText}`);
-        await showEventsMenu(ctx, false);
+        await showEventsMenu(ctx);
       } catch (error) {
         console.error('Не вдалося змінити подію:', error);
         const message = error instanceof Error ? error.message : 'Спробуйте ще раз.';
@@ -1680,7 +1677,7 @@ bot.on('text', async (ctx) => {
       const updatedProfile = readProfile(ctx.from.id);
       if (field === 'reminder_minutes' && prompt && updatedProfile) await editStoredPrompt(ctx, prompt, `✅ Нагадування встановлено за ${updatedProfile.reminder_minutes} хвилин.`, notificationSettingsMenu(updatedProfile), 'plain');
       else if (prompt && updatedProfile) await editStoredPrompt(ctx, prompt, `${profileMenuText(updatedProfile)}\n\n✅ Налаштування оновлено.`, profileMenu(updatedProfile), 'plain');
-      else await showProfileMenu(ctx, false);
+      else await showProfileMenu(ctx);
     } catch (error) {
       console.error('Не вдалося зберегти налаштування:', error);
       await deleteInputMessage(ctx);
