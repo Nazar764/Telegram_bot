@@ -30,11 +30,13 @@ npm start
 
 ## Деплой на Cloudflare
 
-Бот запускається як Cloudflare Container. Для цього потрібен Docker із доступним daemon і тариф Workers Paid. Скопіюй `.env.example` у `.env`, заповни `BOT_TOKEN` та `GEMINI_API_KEY`, потім виконай:
+Бот розгортається як Cloudflare Worker із SQLite Durable Object; Docker і каталог зі статичними файлами не потрібні. Не використовуй `wrangler pages deploy` — це команда для Cloudflare Pages, яка шукає HTML/CSS/JS-файли.
+
+Запускай команди з кореня проєкту (`Telegram_bot`), а не з батьківського каталогу. Скопіюй `.env.example` у `.env` і заповни `BOT_TOKEN`, `GEMINI_API_KEY` та `WEBHOOK_SECRET`, потім виконай:
 
 ```sh
 npm ci
 npm run deploy:cloudflare
 ```
 
-Wrangler завантажить значення з `.env` як Worker secrets і збудує контейнер. Cron trigger щохвилини перевіряє, чи працює бот, і перезапускає контейнер після зупинки. SQLite зберігається всередині контейнера й може очиститися після його перезапуску.
+Скрипт явно вказує Wrangler конфігурацію `wrangler.jsonc`, завантажує значення з `.env` як Worker secrets і розгортає Worker. Після деплою зареєструй Telegram webhook POST-запитом на `/register-webhook`, передавши `Authorization` заголовок із bearer-токеном на основі `WEBHOOK_SECRET`. Cron trigger щохвилини запускає перевірку сповіщень; дані зберігаються в SQLite Durable Object.

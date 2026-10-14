@@ -10,7 +10,7 @@
     "typecheck": "tsc --noEmit",
     "test": "tsx --test test/*.test.ts",
     "types:cloudflare": "wrangler types",
-    "deploy:cloudflare": "wrangler deploy --secrets-file .env"
+    "deploy:cloudflare": "wrangler deploy --config wrangler.jsonc --secrets-file .env"
   },
   "keywords": [],
   "author": "",
