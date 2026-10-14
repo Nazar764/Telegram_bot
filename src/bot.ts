@@ -53,7 +53,7 @@ database.exec(`
     today_event_exclusions_date TEXT NOT NULL DEFAULT '',
     raw_schedule_photo_id TEXT,
     ai_profile_consent INTEGER NOT NULL DEFAULT 1 CHECK (ai_profile_consent IN (0, 1)),
-    is_active INTEGER NOT NULL DEFAULT 0 CHECK (is_active IN (0, 1))
+    is_active INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0, 1))
   );
   CREATE TABLE IF NOT EXISTS setup_state (
     telegram_id INTEGER PRIMARY KEY,
@@ -130,11 +130,12 @@ if (!workerStorage && !setupStateColumns.has('prompt_chat_id')) database.exec('A
 if (!workerStorage && !setupStateColumns.has('prompt_message_id')) database.exec('ALTER TABLE setup_state ADD COLUMN prompt_message_id INTEGER');
 
 const upsertProfile = database.prepare(`
-  INSERT INTO profiles (telegram_id, first_name, username)
-  VALUES (?, ?, ?)
+  INSERT INTO profiles (telegram_id, first_name, username, is_active)
+  VALUES (?, ?, ?, 1)
   ON CONFLICT(telegram_id) DO UPDATE SET
     first_name = excluded.first_name,
-    username = excluded.username
+    username = excluded.username,
+    is_active = 1
 `);
 const getProfile = database.prepare('SELECT telegram_id, is_active, timezone, wake_time, reminder_minutes, weekly_schedule, weekly_schedule_html, bell_schedule, today_events, today_events_date, today_event_exclusions, today_event_exclusions_date, raw_schedule_photo_id, group_name FROM profiles WHERE telegram_id = ?');
 const setProfileActive = database.prepare('UPDATE profiles SET is_active = ? WHERE telegram_id = ?');
@@ -920,6 +921,13 @@ function localTime(timezone: string, now: Date): string {
   }).format(now);
 }
 
+function localTimeAsMinutes(timezone: string, now: Date) {
+  const timeText = localTime(timezone, now);
+  const match = timeText.match(/^(\d{1,2}):(\d{2})$/);
+  if (!match) return undefined;
+  return Number(match[1]) * 60 + Number(match[2]);
+}
+
 let notificationSchedulerBusy = false;
 
 function cleanupExpiredScheduledEvents(now: number) {
@@ -970,8 +978,9 @@ async function runNotificationScheduler() {
         }
       }
 
-      const localNow = localTime(profile.timezone, new Date(now));
-      if (localNow === profile.wake_time && !getNotificationByKey.get(profile.telegram_id, today, 'morning_schedule')) {
+      const localNowMinutes = localTimeAsMinutes(profile.timezone, new Date(now));
+      const wakeMinutes = timeStringToMinutes(profile.wake_time);
+      if (wakeMinutes !== undefined && localNowMinutes !== undefined && Math.abs(localNowMinutes - wakeMinutes) <= 1 && !getNotificationByKey.get(profile.telegram_id, today, 'morning_schedule')) {
         try {
           const schedule = await generateTodaySchedule(profile, new Date(now));
           await bot.telegram.sendMessage(profile.telegram_id, schedule);
@@ -1134,6 +1143,7 @@ bot.start(async (ctx) => {
     pendingInputs.delete(ctx.from.id);
     schedulePhotoDrafts.delete(ctx.from.id);
     upsertProfile.run(ctx.from.id, ctx.from.first_name, ctx.from.username ?? null);
+    setProfileActive.run(1, ctx.from.id);
     const storedMessage = getBotUiMessage.get(ctx.from.id) as { chat_id: number; message_id: number } | undefined;
     if (storedMessage) {
       try {

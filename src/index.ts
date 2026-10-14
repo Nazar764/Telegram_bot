@@ -26,7 +26,7 @@ async function launchBot(): Promise<void> {
 }
 
 void launchBot();
-const notificationScheduler = setInterval(() => void runNotificationScheduler(), 15_000);
+const notificationScheduler = setInterval(() => void runNotificationScheduler(), 5_000);
 notificationScheduler.unref();
 void runNotificationScheduler();
 process.once('SIGINT', () => bot.stop('SIGINT'));
